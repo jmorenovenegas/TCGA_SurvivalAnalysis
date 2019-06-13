@@ -1,0 +1,396 @@
+---
+title: "Análisis de supervivencia"
+author: "Javier Moreno Venegas"
+date: "6/11/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#1. Introduccion
+
+En esta actividad realizaremos un análisis de supervivencia para un conjunto de datos que extraeremos del TCGA (The Cancer Genome Atlar) relacionados con el cáncer de mama.  
+
+##Paquetes utilizados
+```{r, echo=TRUE,message=FALSE, warning=FALSE}
+library(TCGAretriever)
+library(dplyr)
+library(survminer)
+library(survival)
+library(Hmisc)
+```
+
+
+#2. Preparación de los datos  
+
+
+Extraemos todos los estudios relacionados con cáncer del TCGA.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+all_studies <- get_cancer_studies()
+```
+
+
+En concreto nos interesan aquellos relativos al cáncer de mama.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+dplyr::select(filter(all_studies, grepl('Breast', name)), cancer_study_id)
+case_lists <- get_case_lists("brca_tcga")
+#Extraemos los datos clínicos.
+clinical_data <- get_clinical_data("brca_tcga_all")
+```
+
+
+#3. Tratamiento de los datos  
+
+
+El conjunto de datos que hemos descargado presenta 110 variables. Seleccionamos de entre ellas aquellas que nos interesan y las incluimos en nuestro data set.  
+
+
+```{r, echo=TRUE}
+mydata <- select(clinical_data, CASE_ID, OS_STATUS, OS_MONTHS, DFS_MONTHS, DFS_STATUS, MENOPAUSE_STATUS, LYMPH_NODE_EXAMINED_COUNT, ER_STATUS_BY_IHC, PR_STATUS_BY_IHC, IHC_HER2, AGE)
+```
+
+
+Las variables vienen en su mayoría en forma de vector de cadena de caracteres de manera que las modificamos para poder trabajar con ellas.  
+
+
+```{r, echo=TRUE}
+mydata <- filter(mydata, OS_STATUS == 'LIVING'|OS_STATUS == 'DECEASED')
+mydata$OS_STATUS <- as.numeric(mydata$OS_STATUS=='DECEASED')
+```
+
+```{r, echo=TRUE}
+mydata$OS_MONTHS <- as.numeric(mydata$OS_MONTHS)
+```
+
+```{r, echo=TRUE}
+mydata <- filter(mydata, DFS_STATUS == 'DiseaseFree'|DFS_STATUS == 'Recurred/Progressed')
+mydata$DFS_STATUS <- as.numeric(mydata$DFS_STATUS!='DiseaseFree')
+mydata$DFS_MONTHS <- as.numeric(mydata$DFS_MONTHS)
+```
+
+```{r, echo=TRUE}
+Post_indexes <- grep('Post', mydata$MENOPAUSE_STATUS)
+Pre_indexes <- grep('Pre', mydata$MENOPAUSE_STATUS)
+mydata$MENOPAUSE_STATUS[Pre_indexes] <- 'Pre'
+mydata$MENOPAUSE_STATUS[Post_indexes] <- 'Post'
+mydata <- filter(mydata, MENOPAUSE_STATUS == 'Pre' | MENOPAUSE_STATUS == 'Post')
+```
+
+```{r, echo = TRUE}
+mydata$LYMPH_NODE_EXAMINED_COUNT <- as.numeric(mydata$LYMPH_NODE_EXAMINED_COUNT)
+mydata <- filter(mydata, !is.na(mydata$LYMPH_NODE_EXAMINED_COUNT))
+```
+
+```{r, echo=TRUE}
+mydata <- filter(mydata, (ER_STATUS_BY_IHC == 'Positive'|ER_STATUS_BY_IHC == 'Negative') 
+                 & (PR_STATUS_BY_IHC == 'Positive'|PR_STATUS_BY_IHC == 'Negative')
+                 & (IHC_HER2 == 'Positive'|IHC_HER2 == 'Negative'))
+mydata$ER_STATUS_BY_IHC <- as.factor(mydata$ER_STATUS_BY_IHC)
+mydata$PR_STATUS_BY_IHC <- as.factor(mydata$PR_STATUS_BY_IHC)
+mydata$IHC_HER2 <- as.factor(mydata$IHC_HER2)
+```
+
+```{r, echo=TRUE}
+mydata$AGE <- as.numeric(mydata$AGE)
+```
+
+  
+Ya hemos eliminado las observaciones que presentan datos perdidos y hemos convertido las variables al tipo que les corresponde. Ahora crearemos nuestras propias variables para realizar el análisis.  
+
+
+```{r, echo=TRUE}
+mydata <- mutate(mydata, estado_menopausico = as.factor(mydata$MENOPAUSE_STATUS))
+```
+
+  
+Conociendo los marcadores hormonales podemos conocer el fenotipo, que será la variable que estudiaremos.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+extraer_fenotipo <- function(ER, PR, HER2){
+  fenotipo <- character()
+  for(i in 1:length(ER)){
+    if((ER[i] == "Negative") & (PR[i] == "Negative")){
+      if(HER2[i] == "Positive"){
+        fenotipo <- c(fenotipo, "Her2+")
+      }else{
+        fenotipo <- c(fenotipo, "Triple_negativo")
+      }
+    }else{
+        fenotipo <- c(fenotipo, "Luminal")
+      }
+    }
+  return(fenotipo)
+}
+mydata <- mutate(mydata, fenotipo = as.factor(extraer_fenotipo(mydata$ER_STATUS_BY_IHC
+                                     , mydata$PR_STATUS_BY_IHC
+                                     , mydata$IHC_HER2)))
+```
+```{r, echo=TRUE}
+with(mydata, hist(AGE, main = "Histograma de edades", xlab='Edad'))
+with(mydata, hist(LYMPH_NODE_EXAMINED_COUNT, main = "Histograma de nodos afectados", xlab = 'Nodos afectados'))
+mydata <- mutate(mydata
+                 ,edadg = cut(AGE, c(0,50,max(AGE)+1), right = FALSE)
+                 ,nodosg = cut(LYMPH_NODE_EXAMINED_COUNT,
+                               c(0,5,max(LYMPH_NODE_EXAMINED_COUNT)+1), right = FALSE)
+)
+```
+
+  
+Estudiaremos las siguientes variables:  
+1.estado_menopausico: Pre/Post.  
+2.fenotipo: Her2+, Luminal o Triple negativo.   
+3.edadg: Edades en grupos de entre 0 y 50 años y más de 50.  
+4.nodosg: Cantidad de nodos afectados agrupados en menos de 5 y en más de 5.   
+
+  
+#4. Análisis exploratorio  
+
+
+```{r, echo=TRUE}
+with(mydata, prop.table(table(OS_STATUS)))
+with(mydata, prop.table(table(DFS_STATUS)))
+```
+
+  
+El número de sucesos es muy bajo en comparación con el total de observaciones.  
+
+
+```{r, echo=TRUE}
+with(mydata, table(estado_menopausico ,OS_STATUS))
+with(mydata, table(fenotipo ,OS_STATUS))
+with(mydata, table(edadg ,OS_STATUS))
+with(mydata, table(nodosg ,OS_STATUS))
+```
+
+```{r,echo=TRUE}
+with(mydata, table(estado_menopausico ,DFS_STATUS))
+with(mydata, table(fenotipo ,DFS_STATUS))
+with(mydata, table(edadg ,DFS_STATUS))
+with(mydata, table(nodosg ,DFS_STATUS))
+```
+
+  
+##4.1. Curvas de supervivencia  
+
+  
+Visualicemos algunas curvas en función de las variables para ver si encontramos alguna diferencia notable.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ 1 ,data = mydata)
+ggsurvplot(os_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia", pval = TRUE, risk.table = 'abs_pct', xlim = c(0, 60), break.x.by = 12, xlab="Time(months)", legend.title = 'Kaplan-Meier', legend.labs = "Poblacion completa", ylim= c(0.8,1))
+```
+```{r, echo=TRUE, warning=FALSE}
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ 1 ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia libre de recidiva", pval = TRUE, risk.table = 'abs_pct', xlim = c(0, 60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = 'Kaplan-Meier', legend.labs = "Poblacion completa", ylim= c(0.8,1))
+```
+
+  
+En base a las curvas de la población completa se observa que en un seguimiento de 5 años la supervivencia global de la población es superior al 90% y la probabilidad de no recidivar se encuentra entre el 80% y el 85%.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ estado_menopausico ,data = mydata)
+ggsurvplot(os_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia por estado menopausico", xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Estado menopausico", legend.labs = c('Post', 'Pre'), ylim= c(0.8,1))
+```
+
+  
+Se observa cierta diferencia entre las curvas aunque también cierto solapamiento de los intervalos de confiaza de las mismas. Es interesante profundizar en el análisis.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ estado_menopausico ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = TRUE, censor = TRUE, main = "Curva de supervivencia libre de recidiva", pval = TRUE, xlim = c(0,60) ,break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Estado menopausico", legend.labs = c('Post', 'Pre'), ylim= c(0.8,1))
+```
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo ,data = mydata)
+ggsurvplot(os_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia por fenotipo", pval = TRUE, ylim = c(0.8, 1),xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Fenotipo", legend.labs = c('Her2+', 'Luminal', 'Triple negativo'))
+```
+
+  
+La categoría Her2+ presenta muy pocas observaciones y además presenta un sólo evento, lo que se traduce en ruido en la curva. Si ignoramos esta categoría si que puede apreciarse cierta diferencia entre el grupo Luminal y el grupo Triple negativo. Es interesante continuar el estudio de este factor.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ fenotipo ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia libre de recidiva por fenotipo", pval = TRUE, xlim = c(0,60) ,break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Fenotipo", legend.labs = c('Her2+', 'Luminal', 'Triple negativo'), ylim= c(0.8,1))
+```
+
+  
+En este caso se repite lo mencionado anteriormente con Her2+. Esta vez la diferencia entre la categoría Luminal y la categoría Triple negativo no es tan evidente.  
+
+  
+Vamos a repetir las curvas anteriores pero esta vez crearemos otra variable que no presente Her2+.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+mydata <- mutate(mydata
+                 ,fenotipo_sin_Her2plus = base::droplevels(fenotipo, exclude = 'Her2+')
+)
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus ,data = mydata)
+ggsurvplot(os_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia por fenotipo", pval = TRUE, ylim = c(0.8, 1),xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Fenotipo sin Her2+", legend.labs = c('Luminal', 'Triple negativo'))
+
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ fenotipo_sin_Her2plus ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia libre de recidiva por fenotipo", pval = TRUE, xlim = c(0,60) ,break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Fenotipo sin Her2+", legend.labs = c('Luminal', 'Triple negativo'), ylim= c(0.8,1))
+```
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ edadg ,data = mydata)
+ggsurvplot(os_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia por edad", pval = TRUE, xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Edad", legend.labs = c('<50', '>50'), ylim= c(0.8,1))
+```
+
+  
+En este caso no parece interesante indagar en esta variable puesto que los intervalos de confiaza se superponen mucho.  
+
+
+```{r, echo=TRUE, warning=FALSE}
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ edadg ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia libre de recidiva por edad", pval = TRUE, xlim = c(0,60) ,break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Edad", legend.labs = c('<50', '>50'), ylim= c(0.8,1))
+```
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ nodosg ,data = mydata)
+ggsurvplot(os_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia por nodos afectados", pval = TRUE, xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Nodos afectados", legend.labs = c('<5', '>5'), ylim= c(0.8,1))
+```
+```{r, echo=TRUE, warning=FALSE}
+dfs_fit <- surv_fit(Surv(DFS_MONTHS, DFS_STATUS) ~ nodosg ,data = mydata)
+ggsurvplot(dfs_fit, conf.int = TRUE, censor = TRUE, main = "Supervivencia libre de recidiva por nodos afectados", pval = TRUE, xlim = c(0,60) ,break.x.by = 12, xlab="Tiempo(meses)", legend.title = "Nodos afectados", legend.labs = c('<5', '>5'), ylim= c(0.8,1))
+```
+
+  
+##4.3. Comparación de las curvas  
+
+  
+En base a las gráficas parece interesante indagar en la supervivencia global en base al fenotipo, a los nodos afectados, al estado menopáusico y a la edad.  
+
+
+```{r, echo=TRUE}
+survdiff(Surv(OS_MONTHS,OS_STATUS) ~ estado_menopausico, data=mydata)
+```
+
+```{r, echo=TRUE}
+pairwise_survdiff(Surv(OS_MONTHS,OS_STATUS) ~ fenotipo, data=mydata)
+pairwise_survdiff(Surv(OS_MONTHS,DFS_STATUS) ~ fenotipo, data=mydata)
+```
+
+  
+En la supervivencia global se obtiene un p-valor significativo que confirma la diferencia de la categoría Luminal y Triple negativo. En el caso de la supervivencia libre de recidiva no se obtiene como sospechábamos que podría ocurrir dado el solapamiento de las curvas. Vamos a ver ahora que sucede con la variable fenotipo que no presenta Her2+.  
+
+
+```{r, echo=TRUE}
+survdiff(Surv(OS_MONTHS,OS_STATUS) ~ fenotipo_sin_Her2plus, data=mydata)
+survdiff(Surv(OS_MONTHS,DFS_STATUS) ~ fenotipo_sin_Her2plus, data=mydata)
+```
+  
+Los p-valores obtenidos ahora son mucho más significativos por lo que seguiremos trabajando con la variable fenotipo que no presenta Her2+. En el caso de la supervivencia libre de recidiva ahora obtenemos un p-valor ligeramente superior a 0.05 pero continuaremos con su estudio teniéndolo en cuenta.  
+
+```{r, echo=TRUE}
+survdiff(Surv(OS_MONTHS,OS_STATUS) ~ nodosg, data=mydata)
+```
+  
+Obtenemos un p-valor significativo y existía poco solapamiento de los intervalos de confianza de las curvas, por tanto continuamos profundizando.  
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus ,data = mydata)
+ggsurvplot(os_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia por fenotipo entre nodos afectados", pval = TRUE, xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", ylim= c(0.8,1), facet.by = "nodosg", Legend.title = 'Fenotipo')
+```
+  
+Si graficamos una combinación de los dos factores pronóstico observamos una mayor diferencia de las curvas de Luminal y Triple negativo en el caso de presencia de >5 nodos afectados.   
+
+```{r, echo=TRUE, warning=FALSE}
+os_fit <- surv_fit(Surv(OS_MONTHS, DFS_STATUS) ~ fenotipo_sin_Her2plus ,data = mydata)
+ggsurvplot(os_fit, conf.int = FALSE, censor = TRUE, main = "Supervivencia libre de recidiva por fenotipo entre nodos afectados", pval = TRUE, xlim = c(0,60), break.x.by = 12, xlab="Tiempo(meses)", ylim= c(0.5,1), facet.by = "nodosg", legend.title= 'Fenotipo')
+```
+  
+En este caso se observa mayor recidiva en los triple negativo que presentan >5 nodos afectados.  
+  
+#5. Análisis de Cox  
+  
+##5.1. Análisis univariante  
+
+Tras la exploración inicial hemos seleccionado el número de nodos afectados y el fenotipo como relevantes para la supervivencia global. En cuanto a la supervivencia libre de recidiva hemos observado una posible influencia del fenotipo pero esta es difusa dada la presencia de cierto solapamiento de los intervalos de confiaza, estudiaremos el análisis de este caso para confirmar o descartar esta relación.  
+
+Procedemos a realizar un análisis de Cox.  
+
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ nodosg, data=mydata))
+```
+  
+Observamos que el hazard ratio = 4.564 > 1, esto implica un aumento del riesgo asociado a la pertenencia a la clase que tiene >5 nodos afectados, lo que se traduce en una menor probabilidad de supervivencia.  
+
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus, data=mydata))
+```
+
+  
+Observamos que la clase Triple negativo presenta un HR = 3.29 > 1 y siendo un resultado significativo. Esto significa que el riesgo incrementa si el paciente pertenece presenta este fenotipo y por tanto la propabilidad de supervivencia disminuye.  
+
+
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, DFS_STATUS) ~ fenotipo_sin_Her2plus, data=mydata))
+```
+  
+Para la supervivencia libre de recidiva obtenemos que el fenotipo triple negativo presenta un HR > 1, siendo este menor que para la supervivencia global. La significatividad de este resultado es discutible. Por el valor obtenido de 0.06 podría considerarse válido si relajamos el criterio de significatividad de 0.05 como valor umbral, pero teniendo en cuenta el grado de solapamiento que presentan las curvas de la gráfica asociada descartaremos este resultado.  
+  
+##5.2. Análisis multivariante  
+
+
+Vamos a incluir todas las variables en nuestro modelo e iremos eliminando las menos significativas.  
+
+
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus + nodosg + edadg + estado_menopausico, data=mydata))
+```
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus + nodosg + estado_menopausico, data=mydata))
+```
+```{r, echo=TRUE}
+summary(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus + nodosg, data=mydata))
+``` 
+  
+Nos han quedado las mismas variables seleccionadas anteriormente. El análisis de Cox multivariante no nos muestra ninguna información nueva que no hayamos observado en el análisis univariante:
+- El fenotipo Triple negativo aumenta el riesgo(HR = 3.5 > 1) con una alta significancia(orden de 0.001) y la presencia de más de 5 nodos afectados también lo aumenta(HR = 4.75) con una significancia menor pero aun así relevante(orden de 0.01).  
+
+##5.3. Riesgos proporcionales  
+
+Vamos a comprobar si se respeta el criterio de proporcionalidad de Cox para los casos anteriores.  
+
+```{r, echo=TRUE}
+risk <- cox.zph(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus + nodosg, data=mydata))
+risk
+ggcoxzph(risk)
+```
+
+```{r, echo=TRUE}
+risk <- cox.zph(coxph(Surv(OS_MONTHS, OS_STATUS) ~ fenotipo_sin_Her2plus, data=mydata))
+risk
+ggcoxzph(risk)
+```
+
+```{r, echo=TRUE}
+risk <- cox.zph(coxph(Surv(OS_MONTHS, OS_STATUS) ~ nodosg, data=mydata))
+risk
+ggcoxzph(risk)
+```
+  
+Haciendo el estudio de los riesgos proporcionales observamos que los p-valores obtenidos no son significativos para ningún caso, tanto en el estudio multivariable como univariable. Esto implica que el valor de los coeficientes beta no es dependiente del tiempo y por lo tanto podemos tomar como válidos los resultados arrojados por el análisis de Cox realizado previamente.  
+
+#6. Conclusiones  
+
+En base al análisis hemos concluido:  
+- En el margen que hemos considerado relevante de 5 años la población completa presenta una supervivencia superior al 90% y una supervivencia libre de recidiva de entre un 80% y un 85%.  
+- De los factores pronóstico sleccionados se observa que el fenotipo y el número de nodos afectados influyen en las probabilidades de supervivencia.  
+- No hemos obtenido ningún resultado suficientemente significativo en cuanto a la relación de los factores pronóstico y la supervivencia libre de recidiva.  
+- La pertenencia al grupo que presenta el fenotipo Triple negativo reduce las probabilidades de supervivencia en comparación con el grupo que presenta el fenotipo Luminal.  
+- La pertenencia al grupo que presenta más de 5 nodos afectados reduce las probabilidades de supervivencia en comparación con el grupo que presenta menos de 5 nodos afectados.  
+- La combinación de los dos casos anteriores repercute de forma importante en la reducción de probabilidades de supervivencia de la población. De forma que las probabilidades de supervivencia de un paciente que presente más de 5 nodos afectados y un fenotipo Triple negativo son sustancialmente inferiores. 
+
+
+
